@@ -83,8 +83,8 @@ CREATE TABLE entity_jsonb_p1 PARTITION OF entity_jsonb
 CREATE INDEX idx_entity_jsonb_hot_attrs ON entity_jsonb USING GIN (hot_attrs);
 CREATE INDEX idx_entity_jsonb_tenant ON entity_jsonb(tenant_id);
 
--- Main EAV values table (partitioned)
-CREATE TABLE entity_values (
+-- Main EAV values table (TIME-SERIES, partitioned by ingested_at)
+CREATE TABLE entity_values_ts (
     entity_id BIGINT NOT NULL,
     tenant_id BIGINT NOT NULL,
     attribute_id BIGINT NOT NULL,
@@ -94,34 +94,84 @@ CREATE TABLE entity_values (
     value_bool BOOLEAN,
     value_date DATE,
     value_timestamp TIMESTAMP WITH TIME ZONE,
+    ingested_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-    PRIMARY KEY (entity_id, tenant_id, attribute_id)
-) PARTITION BY RANGE (entity_id);
+    PRIMARY KEY (tenant_id, entity_id, attribute_id, ingested_at)
+) PARTITION BY RANGE (ingested_at);
 
--- Create partitions for entity_values
-CREATE TABLE entity_values_p0 PARTITION OF entity_values
-    FOR VALUES FROM (0) TO (1000000);
-    
-CREATE TABLE entity_values_p1 PARTITION OF entity_values
-    FOR VALUES FROM (1000000) TO (2000000);
+-- Create example time partitions (monthly); automate via pg_partman in prod
+CREATE TABLE entity_values_2025_10 PARTITION OF entity_values_ts
+  FOR VALUES FROM ('2025-10-01') TO ('2025-11-01');
 
--- ... continue for all partitions
+-- BRIN index for partition pruning + fast scans
+CREATE INDEX idx_entity_values_ts_brin ON entity_values_ts USING BRIN (ingested_at);
 
--- Composite indexes for EAV queries
-CREATE INDEX idx_entity_values_lookup ON entity_values(tenant_id, entity_id, attribute_id);
-CREATE INDEX idx_entity_values_attr ON entity_values(attribute_id, tenant_id, value);
-CREATE INDEX idx_entity_values_int ON entity_values(attribute_id, tenant_id, value_int) 
-    WHERE value_int IS NOT NULL;
-CREATE INDEX idx_entity_values_date ON entity_values(attribute_id, tenant_id, value_date) 
-    WHERE value_date IS NOT NULL;
+-- Minimal write-lean indexes
+CREATE INDEX idx_entity_values_ts_attr_time ON entity_values_ts(tenant_id, attribute_id, ingested_at);
 
--- Partial indexes for frequently queried attributes (example)
-CREATE INDEX idx_entity_values_status ON entity_values(tenant_id, value) 
-    WHERE attribute_id = 1; -- Assuming attribute_id 1 is 'status'
+-- UNLOGGED staging table for bursty ingest (COPY target)
+CREATE UNLOGGED TABLE entity_values_ingest (
+    entity_id BIGINT NOT NULL,
+    tenant_id BIGINT NOT NULL,
+    attribute_id BIGINT NOT NULL,
+    value TEXT,
+    value_int BIGINT,
+    value_decimal DECIMAL(20,5),
+    value_bool BOOLEAN,
+    value_date DATE,
+    value_timestamp TIMESTAMP WITH TIME ZONE,
+    ingested_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+);
 
-CREATE INDEX idx_entity_values_category ON entity_values(tenant_id, value) 
-    WHERE attribute_id = 2; -- Assuming attribute_id 2 is 'category'
+-- Hot projection upsert (immediate read-after-write)
+CREATE OR REPLACE FUNCTION upsert_hot_attrs(
+    p_tenant_id BIGINT,
+    p_entity_id BIGINT,
+    p_delta JSONB
+) RETURNS VOID AS $$
+BEGIN
+  INSERT INTO entity_jsonb(entity_id, tenant_id, hot_attrs)
+  VALUES (p_entity_id, p_tenant_id, p_delta)
+  ON CONFLICT (entity_id, tenant_id)
+  DO UPDATE SET 
+    hot_attrs = entity_jsonb.hot_attrs || EXCLUDED.hot_attrs,
+    updated_at = CURRENT_TIMESTAMP;
+END;$$ LANGUAGE plpgsql;
+
+-- Batch flush from staging into time-series table (write-optimized)
+CREATE OR REPLACE FUNCTION stage_flush(p_limit INT DEFAULT 50000)
+RETURNS INT AS $$
+DECLARE
+  v_count INT;
+BEGIN
+  SET LOCAL synchronous_commit = off;
+  WITH moved AS (
+    INSERT INTO entity_values_ts (
+      entity_id, tenant_id, attribute_id, value, value_int, value_decimal,
+      value_bool, value_date, value_timestamp, ingested_at
+    )
+    SELECT entity_id, tenant_id, attribute_id, value, value_int, value_decimal,
+           value_bool, value_date, value_timestamp, COALESCE(ingested_at, now())
+    FROM entity_values_ingest
+    ORDER BY ingested_at
+    LIMIT p_limit
+    RETURNING tenant_id, entity_id, attribute_id, value
+  )
+  SELECT COUNT(*) INTO v_count FROM moved;
+
+  -- Optionally upsert hot attributes for a subset of keys here
+  -- PERFORM upsert_hot_attrs(...);
+
+  DELETE FROM entity_values_ingest
+  USING (
+    SELECT ctid FROM entity_values_ingest
+    ORDER BY ingested_at
+    LIMIT p_limit
+  ) del
+  WHERE entity_values_ingest.ctid = del.ctid;
+
+  RETURN v_count;
+END;$$ LANGUAGE plpgsql;
 
 -- Materialized view for common aggregations
 CREATE MATERIALIZED VIEW mv_entity_attribute_stats AS
@@ -131,9 +181,9 @@ SELECT
     a.attribute_name,
     COUNT(DISTINCT ev.entity_id) as distinct_entities,
     COUNT(*) as total_values,
-    MIN(ev.updated_at) as oldest_update,
-    MAX(ev.updated_at) as newest_update
-FROM entity_values ev
+    MIN(ev.ingested_at) as oldest,
+    MAX(ev.ingested_at) as newest
+FROM entity_values_ts ev
 JOIN attributes a ON ev.attribute_id = a.attribute_id
 GROUP BY ev.tenant_id, ev.attribute_id, a.attribute_name;
 
