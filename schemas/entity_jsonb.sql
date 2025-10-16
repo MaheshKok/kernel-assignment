@@ -53,14 +53,12 @@ ALTER TABLE entity_jsonb ENABLE ROW LEVEL SECURITY;
 
 -- Application users: must set app.current_tenant_id session variable
 CREATE POLICY tenant_isolation_policy_jsonb ON entity_jsonb
-    FOR ALL
-    TO PUBLIC
-    USING (tenant_id = current_setting('app.current_tenant_id', true)::bigint)
-    WITH CHECK (tenant_id = current_setting('app.current_tenant_id', true)::bigint);
+    FOR ALL TO PUBLIC
+        USING (tenant_id = current_setting('app.current_tenant_id', TRUE)::bigint)
+        WITH CHECK (tenant_id = current_setting('app.current_tenant_id', TRUE)::bigint);
 
 -- Note: Background jobs/ingestion functions should use SECURITY DEFINER
 -- to bypass RLS when processing multi-tenant batches
-
 -- ============================================================================
 -- AUTOVACUUM TUNING (Aggressive: 1% threshold for frequent updates)
 -- ============================================================================
@@ -72,23 +70,22 @@ ALTER TABLE entity_jsonb SET (autovacuum_vacuum_threshold = 100, autovacuum_vacu
 -- FUNCTIONS
 -- ============================================================================
 -- SECURITY DEFINER: Bypasses RLS to allow multi-tenant batch updates
-CREATE OR REPLACE FUNCTION upsert_hot_attrs(
-    p_tenant_id bigint, 
-    p_entity_id bigint, 
-    p_delta jsonb
-)
-RETURNS VOID 
-SECURITY DEFINER
-SET search_path = public
-AS $$
+CREATE OR REPLACE FUNCTION upsert_hot_attrs(p_tenant_id bigint, p_entity_id bigint, p_delta jsonb)
+    RETURNS VOID
+    SECURITY DEFINER
+    SET search_path = public
+    AS $$
 BEGIN
     INSERT INTO entity_jsonb(entity_id, tenant_id, hot_attrs)
-    VALUES(p_entity_id, p_tenant_id, p_delta)
-    ON CONFLICT(entity_id, tenant_id) DO UPDATE SET
-        hot_attrs = entity_jsonb.hot_attrs || EXCLUDED.hot_attrs,
-        updated_at = CURRENT_TIMESTAMP;
+        VALUES(p_entity_id, p_tenant_id, p_delta)
+    ON CONFLICT(entity_id, tenant_id)
+        DO UPDATE SET
+            hot_attrs = entity_jsonb.hot_attrs || EXCLUDED.hot_attrs,
+            updated_at = CURRENT_TIMESTAMP;
 END;
-$$ LANGUAGE plpgsql;
+$$
+LANGUAGE plpgsql;
+
 -- ============================================================================
 -- STATISTICS
 -- ============================================================================

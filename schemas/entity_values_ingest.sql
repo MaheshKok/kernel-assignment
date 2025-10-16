@@ -30,10 +30,10 @@ ALTER TABLE entity_values_ingest SET (autovacuum_vacuum_threshold = 50, autovacu
 -- ============================================================================
 -- SECURITY DEFINER: Bypasses RLS to allow multi-tenant batch inserts from staging
 CREATE OR REPLACE FUNCTION stage_flush(p_limit int DEFAULT 50000)
-RETURNS int 
-SECURITY DEFINER
-SET search_path = public
-AS $$
+    RETURNS int
+    SECURITY DEFINER
+    SET search_path = public
+    AS $$
 DECLARE
     v_count int;
 BEGIN

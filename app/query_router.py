@@ -148,7 +148,8 @@ class DatabasePool:
                     with replica_conn.cursor() as cur:
                         cur.execute(
                             """
-                            SELECT EXTRACT(EPOCH FROM timestamp AT TIME ZONE 'UTC') * 1000
+                            SELECT 
+                                EXTRACT(EPOCH FROM timestamp AT TIME ZONE 'UTC') * 1000
                             FROM replication_heartbeat
                             WHERE source = 'primary'
                             ORDER BY timestamp DESC
@@ -471,11 +472,13 @@ if __name__ == "__main__":
     # CRITICAL: Pass tenant_id for RLS isolation
     results, metadata = router.execute_query(
         """
-        SELECT e.entity_id, ej.hot_attrs
+        SELECT 
+            e.entity_id, ej.hot_attrs
         FROM entities e
-        JOIN entity_jsonb ej USING (entity_id, tenant_id)
+        JOIN entity_jsonb ej 
+        USING (entity_id, tenant_id)
         WHERE e.tenant_id = %s
-          AND ej.hot_attrs->>'status' = %s
+        AND ej.hot_attrs->>'status' = %s
         LIMIT 100
         """,
         (123, "active"),
