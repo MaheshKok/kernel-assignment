@@ -230,7 +230,7 @@ BEGIN
     FROM entity_values_ts ev
     JOIN attribute_filters af ON ev.attribute_id = af.attr_id
     WHERE ev.tenant_id = p_tenant_id
-    AND ev.ingested_at >= NOW() - (p_recent_days || ' days')::INTERVAL
+    AND ev.ingested_at >= NOW() - make_interval(days => p_recent_days)
     AND (
         (af.op = '=' AND ev.value = af.attr_value) OR
         (af.op = '>' AND ev.value_int > af.attr_value::BIGINT) OR
