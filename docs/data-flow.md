@@ -54,11 +54,14 @@ This document details the complete replication flow from OLTP (PostgreSQL) to OL
 │  ┌─────────────────────┐       ┌───────────────────────────┐               │
 │  │  Read Replica #1    │       │  Logical Replication      │               │
 │  │  (Near-RT queries)  │       │  Slot: debezium_slot      │               │
-│  │  - Lag target: <3s  │       │  - Retained WAL: 10GB     │               │
-│  │  - Max lag alarm:   │       │  - Heartbeat: 10s         │               │
-│  │    5s → route to    │       └───────────┬───────────────┘               │
-│  │    primary          │                   │                                │
-│  └─────────────────────┘                   │                                │
+│  │  - Lag target: <3s  │       │  - Plugin: wal2json       │               │
+│  │  - Max lag alarm:   │       │  - Retained WAL: 10GB     │               │
+│  │    5s → route to    │       │  - Heartbeat: 10s         │               │
+│  │    primary          │       │  - Publication: eav_cdc   │               │
+│  └─────────────────────┘       └───────────┬───────────────┘               │
+│                                             │                                │
+│                                             │ Debezium Connector             │
+│                                             │ (Kafka Connect)                │
 │                                            │                                │
 └────────────────────────────────────────────┼────────────────────────────────┘
                                              │
@@ -166,7 +169,189 @@ This document details the complete replication flow from OLTP (PostgreSQL) to OL
 
 ---
 
-## 2. Freshness Budget Matrix
+## 2. Debezium CDC Configuration
+
+### PostgreSQL Logical Replication Setup
+
+**Step 1: Enable Logical Replication (RDS Parameter Group)**
+```sql
+-- In RDS parameter group
+wal_level = logical
+max_replication_slots = 5
+max_wal_senders = 5
+wal_sender_timeout = 60000  -- 60 seconds
+```
+
+**Step 2: Create Publication (on Primary DB)**
+```sql
+-- Create publication for tables we want to replicate
+CREATE PUBLICATION eav_cdc FOR TABLE 
+    entities,
+    entity_values_ts,
+    entity_jsonb
+WITH (publish = 'insert,update,delete');
+
+-- Verify publication
+SELECT * FROM pg_publication WHERE pubname = 'eav_cdc';
+```
+
+**Step 3: Create Replication Slot**
+```sql
+-- Create logical replication slot for Debezium
+SELECT pg_create_logical_replication_slot('debezium_slot', 'wal2json');
+
+-- Monitor slot status
+SELECT 
+    slot_name,
+    plugin,
+    slot_type,
+    database,
+    active,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS retained_wal
+FROM pg_replication_slots
+WHERE slot_name = 'debezium_slot';
+```
+
+### Debezium Connector Configuration
+
+**Kafka Connect Deployment (ECS Task)**
+```json
+{
+  "name": "eav-postgres-source",
+  "config": {
+    "connector.class": "io.debezium.connector.postgresql.PostgresConnector",
+    "database.hostname": "eav-db-primary.123456.us-west-2.rds.amazonaws.com",
+    "database.port": "5432",
+    "database.user": "debezium_user",
+    "database.password": "${secret:debezium-password}",
+    "database.dbname": "eav_db",
+    "database.server.name": "postgres",
+    "plugin.name": "wal2json",
+    "slot.name": "debezium_slot",
+    "publication.name": "eav_cdc",
+    
+    "table.include.list": "public.entities,public.entity_values_ts,public.entity_jsonb",
+    
+    "snapshot.mode": "initial",
+    "snapshot.locking.mode": "none",
+    
+    "heartbeat.interval.ms": "10000",
+    "heartbeat.action.query": "INSERT INTO _heartbeat (node_id, node_type, last_heartbeat, write_sequence) VALUES ('debezium', 'cdc', now(), nextval('heartbeat_seq')) ON CONFLICT (node_id) DO UPDATE SET last_heartbeat = EXCLUDED.last_heartbeat, write_sequence = EXCLUDED.write_sequence",
+    
+    "transforms": "unwrap,addTenantIdHeader",
+    "transforms.unwrap.type": "io.debezium.transforms.ExtractNewRecordState",
+    "transforms.unwrap.drop.tombstones": "false",
+    "transforms.addTenantIdHeader.type": "org.apache.kafka.connect.transforms.InsertField$Value",
+    "transforms.addTenantIdHeader.static.field": "tenant_id",
+    
+    "topic.prefix": "postgres.eav",
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter.schemas.enable": "true",
+    
+    "max.batch.size": "2048",
+    "max.queue.size": "8192",
+    "poll.interval.ms": "1000",
+    
+    "errors.tolerance": "all",
+    "errors.log.enable": "true",
+    "errors.log.include.messages": "true"
+  }
+}
+```
+
+**Key Configuration Choices:**
+
+| Parameter | Value | Rationale |
+|-----------|-------|----------|
+| `snapshot.mode` | `initial` | Take initial snapshot, then stream changes |
+| `snapshot.locking.mode` | `none` | Don't lock tables (use for large tables) |
+| `heartbeat.interval.ms` | `10000` | Detect lag every 10 seconds |
+| `max.batch.size` | `2048` | Balance throughput vs. lag (2K events/poll) |
+| `errors.tolerance` | `all` | Continue on errors (log + skip bad records) |
+| `transforms.unwrap` | Yes | Flatten Debezium envelope (easier consumption) |
+
+### Kafka Topic Schema
+
+**Before Unwrap (Debezium Envelope):**
+```json
+{
+  "schema": { ... },
+  "payload": {
+    "before": null,
+    "after": {
+      "entity_id": 12345,
+      "tenant_id": 123,
+      "status": "active"
+    },
+    "source": {
+      "version": "2.4.0",
+      "connector": "postgresql",
+      "name": "postgres",
+      "ts_ms": 1697472000000,
+      "snapshot": "false",
+      "db": "eav_db",
+      "schema": "public",
+      "table": "entities",
+      "txId": 12345678,
+      "lsn": 987654321,
+      "xmin": null
+    },
+    "op": "c",  // c=create, u=update, d=delete
+    "ts_ms": 1697472000100
+  }
+}
+```
+
+**After Unwrap (Simplified):**
+```json
+{
+  "entity_id": 12345,
+  "tenant_id": 123,
+  "status": "active",
+  "__op": "c",
+  "__ts_ms": 1697472000100,
+  "__lsn": 987654321
+}
+```
+
+### Monitoring Debezium
+
+**Kafka Connect Metrics (Prometheus)**
+```yaml
+# Connector status
+debezium_connector_status{name="eav-postgres-source"} = 1  # 1=running, 0=stopped
+
+# Events per second
+rate(debezium_events_total[1m])
+
+# Lag (milliseconds)
+debezium_lag_ms{table="entities"}
+debezium_lag_ms{table="entity_values_ts"}
+
+# Error count
+sum(rate(debezium_errors_total[5m]))
+```
+
+**CloudWatch Dashboard Query:**
+```sql
+-- Check if Debezium is keeping up
+SELECT 
+    topic,
+    partition,
+    "offset" AS current_offset,
+    log_end_offset - "offset" AS lag_messages,
+    ROUND((log_end_offset - "offset") / 10000.0, 2) AS lag_seconds  -- Assuming 10K writes/sec
+FROM kafka_consumer_offsets
+WHERE consumer_group = 'debezium-connector'
+  AND topic LIKE 'postgres.eav.%'
+ORDER BY lag_messages DESC;
+```
+
+---
+
+## 3. Freshness Budget Matrix
 
 This matrix defines acceptable staleness for different read paths and use cases.
 
@@ -546,7 +731,216 @@ User Query
 
 ---
 
-## 9. Future Enhancements
+## 9. OLAP Platform Comparison: Redshift vs. ClickHouse
+
+### Decision Matrix
+
+This project uses **Redshift** for OLAP, but **ClickHouse** is a strong alternative for real-time analytics.
+
+| Factor | Redshift | ClickHouse | Winner |
+|--------|----------|------------|--------|
+| **Ingestion Latency** | 5-15 min (batch COPY) | <1 second (streaming INSERT) | ✅ ClickHouse |
+| **Query Latency (cold)** | 2-10s (complex aggregates) | 500ms-2s (pre-aggregated tables) | ✅ ClickHouse |
+| **Query Latency (warm)** | 1-3s (result caching) | 100-500ms (native caching) | ✅ ClickHouse |
+| **Compression Ratio** | 3-5x (columnar + Snappy) | 10-20x (aggressive columnar) | ✅ ClickHouse |
+| **Storage Cost** | $23/TB/month (managed S3) | $10/TB/month (EBS + S3 tiering) | ✅ ClickHouse |
+| **Concurrency** | 50-500 concurrent queries | 100-1000+ concurrent queries | ✅ ClickHouse |
+| **SQL Compatibility** | Full ANSI SQL + window fns | 90% SQL (some PostgreSQL extensions missing) | ✅ Redshift |
+| **Managed Service** | Fully managed (AWS) | Self-hosted or Altinity Cloud | ✅ Redshift |
+| **Operational Complexity** | Low (push-button scaling) | Medium (requires tuning, sharding) | ✅ Redshift |
+| **BI Tool Integration** | Excellent (native Tableau, Looker) | Good (JDBC/ODBC, some BI tools) | ✅ Redshift |
+| **Data Deduplication** | Manual (MERGE, staging tables) | Automatic (ReplacingMergeTree) | ✅ ClickHouse |
+| **Time-Series Optimization** | Requires sort keys + partitions | Native (TTL, rollups, materialized views) | ✅ ClickHouse |
+| **Total Cost (4-node cluster)** | $2,800/month (ra3.4xlarge × 4) | $1,200/month (c6i.4xlarge × 4 on EC2) | ✅ ClickHouse |
+
+**Overall Winner:** ClickHouse for **real-time analytics** (<1 second lag), Redshift for **operational simplicity**
+
+---
+
+### When to Use Redshift
+
+✅ **Choose Redshift if:**
+1. You need **fully managed** service (no infrastructure management)
+2. Your BI tools (Tableau, Looker) have native Redshift connectors
+3. You're already in AWS ecosystem (tight integration with S3, Glue, QuickSight)
+4. Your analytics workload is **batch-oriented** (hourly/daily reports)
+5. You need **concurrency scaling** for unpredictable query spikes
+6. Your team is **familiar with PostgreSQL** (Redshift is PostgreSQL-based)
+
+**Example Use Case:**
+- Monthly executive dashboards
+- Ad-hoc SQL queries by business analysts
+- Integration with existing AWS data lake (S3 + Athena)
+
+---
+
+### When to Use ClickHouse
+
+✅ **Choose ClickHouse if:**
+1. You need **sub-second query latency** for real-time dashboards
+2. Your data is **time-series heavy** (logs, metrics, events)
+3. You have **high write throughput** (>100K inserts/sec)
+4. You want **lower costs** (50-70% cheaper than Redshift)
+5. You need **automatic deduplication** (ReplacingMergeTree, SummingMergeTree)
+6. You're okay with **self-hosting** (or using Altinity Cloud, ClickHouse Cloud)
+
+**Example Use Case:**
+- Real-time operational dashboards (device health, alerts)
+- High-frequency analytics (per-minute aggregations)
+- Log analytics (APM, security events)
+
+---
+
+### Architecture Comparison
+
+**Current (Redshift):**
+```
+Postgres → Kafka → Flink (30s batch) → S3 Parquet → Redshift COPY (5 min)
+                                                    │
+                                                    └─→ End-to-end lag: 5-8 min
+```
+
+**Alternative (ClickHouse):**
+```
+Postgres → Kafka → ClickHouse Kafka Engine (streaming) → ClickHouse MergeTree
+                                                          │
+                                                          └─→ End-to-end lag: <10 sec
+```
+
+---
+
+### ClickHouse Implementation Details
+
+**Table Engine: ReplacingMergeTree (Automatic Deduplication)**
+```sql
+CREATE TABLE entity_values_clickhouse (
+    tenant_id UInt64,
+    entity_id UInt64,
+    attribute_id UInt64,
+    value String,
+    value_int Nullable(Int64),
+    value_decimal Nullable(Decimal(20, 5)),
+    ingested_at DateTime64(3),
+    version UInt64  -- For deduplication (higher = newer)
+)
+ENGINE = ReplacingMergeTree(version)
+PARTITION BY toYYYYMM(ingested_at)
+ORDER BY (tenant_id, entity_id, attribute_id, ingested_at)
+TTL ingested_at + INTERVAL 90 DAY;  -- Auto-delete after 90 days
+```
+
+**Kafka Ingestion (Real-Time)**
+```sql
+-- Create Kafka table (reads from Kafka topic)
+CREATE TABLE entity_values_kafka (
+    tenant_id UInt64,
+    entity_id UInt64,
+    attribute_id UInt64,
+    value String,
+    value_int Nullable(Int64),
+    value_decimal Nullable(Decimal(20, 5)),
+    ingested_at DateTime64(3),
+    version UInt64
+)
+ENGINE = Kafka
+SETTINGS 
+    kafka_broker_list = 'kafka-broker-1:9092,kafka-broker-2:9092',
+    kafka_topic_list = 'postgres.eav.entity_values_ts',
+    kafka_group_name = 'clickhouse_consumer',
+    kafka_format = 'JSONEachRow',
+    kafka_num_consumers = 3;
+
+-- Materialized view: Auto-insert from Kafka to MergeTree
+CREATE MATERIALIZED VIEW entity_values_kafka_mv TO entity_values_clickhouse AS
+SELECT *
+FROM entity_values_kafka;
+```
+
+**Pre-Aggregation (Materialized View)**
+```sql
+-- Aggregate metrics per hour (automatic rollup)
+CREATE MATERIALIZED VIEW agg_hourly_metrics
+ENGINE = SummingMergeTree()
+PARTITION BY toYYYYMM(hour)
+ORDER BY (tenant_id, attribute_id, hour)
+AS SELECT
+    tenant_id,
+    attribute_id,
+    toStartOfHour(ingested_at) AS hour,
+    count() AS sample_count,
+    avg(value_decimal) AS avg_value,
+    min(value_decimal) AS min_value,
+    max(value_decimal) AS max_value
+FROM entity_values_clickhouse
+WHERE value_decimal IS NOT NULL
+GROUP BY tenant_id, attribute_id, hour;
+
+-- Query: Get hourly averages (instant response)
+SELECT 
+    hour,
+    attribute_id,
+    avg_value
+FROM agg_hourly_metrics
+WHERE tenant_id = 123
+  AND hour >= now() - INTERVAL 7 DAY
+ORDER BY hour DESC;
+```
+
+**Query Performance Comparison**
+
+| Query Type | Redshift | ClickHouse | Improvement |
+|------------|----------|------------|-------------|
+| Simple aggregate (1 day) | 2-5s | 200-500ms | 4-10x faster |
+| Complex joins (7 days) | 10-30s | 1-3s | 10x faster |
+| Full scan (90 days) | 60-180s | 5-15s | 12x faster |
+| Pre-aggregated query | 1-2s | 50-100ms | 20x faster |
+
+---
+
+### Cost Analysis: 4-Node Cluster
+
+**Redshift:**
+- Instance: ra3.4xlarge × 4 nodes
+- Compute: 48 vCPU, 384GB RAM
+- Storage: Managed S3 (10TB = $230/month)
+- Total: **$2,800/month**
+
+**ClickHouse (Self-Hosted on EC2):**
+- Instance: c6i.4xlarge × 4 nodes (EBS gp3 + S3 tiering)
+- Compute: 64 vCPU, 128GB RAM
+- Storage: 2TB EBS (hot) + 10TB S3 (cold) = $400/month
+- Total: **$1,200/month** (57% cheaper)
+
+**ClickHouse Cloud (Managed):**
+- Similar to EC2 but with auto-scaling, backups, monitoring
+- Total: **$1,800/month** (36% cheaper than Redshift)
+
+---
+
+### Recommendation
+
+**For this EAV project:**
+
+**Phase 1 (Current): Use Redshift**
+- Faster to implement (managed service)
+- Team familiarity with SQL/PostgreSQL
+- Good enough for 5-15 min lag SLA
+
+**Phase 2 (12 months): Evaluate ClickHouse**
+- When real-time dashboards become critical (<10s lag)
+- When query costs grow (>$5K/month on Redshift)
+- When write throughput exceeds 20K/sec
+
+**Hybrid Approach:**
+```
+Postgres → Kafka → ┬─→ ClickHouse (real-time dashboards, <10s lag)
+                   │
+                   └─→ Redshift (historical reports, <15 min lag)
+```
+
+---
+
+## 10. Future Enhancements
 
 **Short-term (3-6 months):**
 - [ ] Implement read-your-writes guarantee via sticky sessions
