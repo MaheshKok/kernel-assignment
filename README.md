@@ -1,11 +1,13 @@
 # EAV at Scale - Complete Solution
 
 ## Overview
+
 Production-ready EAV (Entity-Attribute-Value) design for AtlasCo's telemetry platform, sustaining **~10k writes/sec**, providing **immediate read-after-write**, and replicating to analytics with explicit freshness handling.
 
 ## Architecture Highlights
 
 ### Write Path (10K inserts/sec capable)
+
 - **UNLOGGED staging table** (`entity_values_ingest`) for bulk COPY operations
 - **Async commit** (`synchronous_commit=off`) for non-critical writes
 - **Batch flush** every 100ms via `stage_flush()` function
@@ -13,12 +15,14 @@ Production-ready EAV (Entity-Attribute-Value) design for AtlasCo's telemetry pla
 - **Prepared statements** with parameterized queries
 
 ### Read Path (Immediate consistency)
+
 - **Hot JSONB projection** (`entity_jsonb`) for read-after-write guarantees
 - **Redis cache** (ElastiCache with 3-node cluster) for sub-10ms reads
 - **Query router** with circuit breaker and lag-aware replica selection
 - **3 read replicas** (prod) with <3s lag SLA
 
 ### Data Model
+
 ```
 entities              # Base table
 ├── entity_id
@@ -41,11 +45,13 @@ entity_values_ingest  # UNLOGGED staging
 ```
 
 ### Partitioning Strategy
+
 - **Time-series RANGE partitions** on `ingested_at` (monthly, auto-created via pg_partman)
 - **BRIN indexes** for efficient partition pruning
 - **Hash sub-partitioning** available for hot partitions
 
 ### Infrastructure
+
 - **PostgreSQL 15.4** on RDS (db.r6g.8xlarge in prod)
 - **ElastiCache Redis 7.0** (cache.r6g.2xlarge x 3)
 - **Redshift ra3.4xlarge** x 3 for OLAP
@@ -56,6 +62,7 @@ entity_values_ingest  # UNLOGGED staging
 ## Quick Start
 
 ### 1. Deploy Infrastructure
+
 ```bash
 cd infra
 terraform init
@@ -64,11 +71,13 @@ terraform apply -var environment=prod
 ```
 
 ### 2. Initialize Database
+
 ```bash
 psql -h <rds-endpoint> -U eav_admin -d eav_db -f schema.sql
 ```
 
 ### 3. Configure Application
+
 ```python
 from app.query_router import DatabasePool, QueryRouter, WriteOptimizer
 
@@ -87,6 +96,7 @@ writer = WriteOptimizer(db_pool)
 ```
 
 ### 4. Ingest Telemetry
+
 ```python
 events = [...]  # List of events
 writer.ingest_telemetry(events)
@@ -100,6 +110,7 @@ writer.upsert_hot_attributes(
 ```
 
 ### 5. Query Data
+
 ```python
 # Strong consistency (primary)
 results, meta = router.execute_query(
@@ -122,17 +133,18 @@ print(f"Source: {meta.source}, Lag: {meta.lag_ms}ms")
 
 ## Performance Benchmarks
 
-| Operation | Target | Actual |
-|-----------|--------|--------|
-| Write throughput | 10k/sec | 12k/sec (burst) |
-| Operational query | <100ms | 20-50ms (95th pct) |
-| Read-after-write | <50ms | 15-30ms (hot attrs) |
-| Replica lag | <3s | 250ms (avg) |
-| Redis cache hit | >80% | 85-92% |
+| Operation         | Target  | Actual              |
+| ----------------- | ------- | ------------------- |
+| Write throughput  | 10k/sec | 12k/sec (burst)     |
+| Operational query | <100ms  | 20-50ms (95th pct)  |
+| Read-after-write  | <50ms   | 15-30ms (hot attrs) |
+| Replica lag       | <3s     | 250ms (avg)         |
+| Redis cache hit   | >80%    | 85-92%              |
 
 ## Operational Excellence
 
 ### Monitoring
+
 ```bash
 # Run health check
 psql -c "SELECT health_check()"
@@ -145,6 +157,7 @@ SELECT * FROM check_replication_lag();
 ```
 
 ### Alerting (CloudWatch)
+
 - RDS CPU > 80%
 - Replica lag > 3s
 - Free storage < 10GB
@@ -152,6 +165,7 @@ SELECT * FROM check_replication_lag();
 - Staging table > 1M rows
 
 ### Maintenance
+
 ```bash
 # Partition rotation (automated via pg_partman)
 SELECT partman.run_maintenance();
@@ -172,6 +186,7 @@ REFRESH MATERIALIZED VIEW CONCURRENTLY mv_entity_attribute_stats;
 5. **Autoscaling**: Read replicas scale based on CPU
 
 Estimated monthly cost (prod):
+
 - RDS: $4,500 (writer + 3 replicas)
 - ElastiCache: $1,200
 - Redshift: $3,000
@@ -181,6 +196,7 @@ Estimated monthly cost (prod):
 ## Scaling Beyond Current Design
 
 When hitting limits:
+
 1. **Citus extension**: Horizontal sharding for 1B+ entities
 2. **TimescaleDB**: Purpose-built time-series engine
 3. **ClickHouse**: Column-oriented OLAP alternative
@@ -189,6 +205,7 @@ When hitting limits:
 ## Trade-offs & Limitations
 
 ### Strengths
+
 ✅ High write throughput (10k+/sec)
 ✅ Immediate read-after-write for critical UX
 ✅ Flexible schema evolution
@@ -196,6 +213,7 @@ When hitting limits:
 ✅ Explicit freshness handling
 
 ### Weaknesses
+
 ⚠️ Dual-write complexity (TS + hot JSONB)
 ⚠️ BRIN less selective on small partitions
 ⚠️ Extra RAM for Redis cache layer
@@ -203,6 +221,7 @@ When hitting limits:
 ⚠️ Cross-attribute JOINs still expensive
 
 ### Fallbacks
+
 - Partial indexes on proven-hot attributes
 - Materialized views for common patterns
 - Bloom filters for existence checks
@@ -232,13 +251,12 @@ When hitting limits:
 ├── solution.md              # Design document
 ├── schema.sql               # PostgreSQL DDL + queries
 ├── infra/
-│   ├── main.tf              # Original Terraform
-│   └── main-improved.tf     # Complete infrastructure
+│   └── main.tf              # Original Terraform
 ├── app/
 │   └── query_router.py      # Application routing logic
 ├── ops/
 │   └── monitoring.sql       # Monitoring queries
-├── notes.md                 # TODOs + follow-up questions
+├── notes.md                 # TODOs
 └── README.md                # This file
 ```
 
