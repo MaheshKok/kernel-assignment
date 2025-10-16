@@ -108,13 +108,15 @@ class DatabasePool:
                 try:
                     replica_conn = replica_pool.getconn()
                     with replica_conn.cursor() as cur:
-                        cur.execute("""
+                        cur.execute(
+                            """
                             SELECT EXTRACT(EPOCH FROM timestamp AT TIME ZONE 'UTC') * 1000
                             FROM replication_heartbeat
                             WHERE source = 'primary'
                             ORDER BY timestamp DESC
                             LIMIT 1
-                        """)
+                        """
+                        )
                         result = cur.fetchone()
                         if result:
                             replica_ts = result[0]

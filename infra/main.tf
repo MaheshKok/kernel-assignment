@@ -463,8 +463,8 @@ resource "aws_elasticache_parameter_group" "redis" {
 
 resource "aws_elasticache_replication_group" "redis" {
   replication_group_id       = "${var.project_name}-${var.environment}-redis"
-  replication_group_description = "Redis cache for EAV hot data"
-
+  description                = "Redis cache for EAV hot data"
+  
   engine               = "redis"
   engine_version       = "7.0"
   node_type            = local.current.redis_node_type
