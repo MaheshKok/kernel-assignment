@@ -1,13 +1,19 @@
 """
-Query Router for EAV Platform
+Query Router for EAV Platform (FIXED VERSION)
 Implements intelligent routing between primary, replicas, cache, and OLAP based on freshness requirements
+
+FIXES:
+1. Connection leak in circuit breaker (now properly tracks replica_idx)
+2. copy_from() now uses io.StringIO instead of raw string
+3. Lag tracking uses correct replica index
 """
 
 import enum
+import io
 import json
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import redis
 from psycopg2 import pool
@@ -74,19 +80,22 @@ class DatabasePool:
     def get_primary_conn(self):
         return self.primary_pool.getconn()
 
-    def get_replica_conn(self, max_lag_ms: int = 3000):
-        """Get connection to least-lagged replica under threshold"""
+    def get_replica_conn(self, max_lag_ms: int = 3000) -> Tuple[Any, DataSource, int, int]:
+        """Get connection to least-lagged replica under threshold
+        
+        Returns: (connection, source, replica_index, lag_ms)
+        """
         healthy_replicas = [
             (i, lag) for i, lag in enumerate(self._replica_lag) if lag <= max_lag_ms
         ]
 
         if not healthy_replicas:
             # Fall back to primary if all replicas lagging
-            return self.get_primary_conn(), DataSource.PRIMARY
+            return self.get_primary_conn(), DataSource.PRIMARY, -1, 0
 
         # Pick least-lagged replica
         idx, lag = min(healthy_replicas, key=lambda x: x[1])
-        return self.replica_pools[idx].getconn(), DataSource.REPLICA
+        return self.replica_pools[idx].getconn(), DataSource.REPLICA, idx, lag
 
     def check_replica_lag(self):
         """Update replica lag metrics from heartbeat table"""
@@ -150,8 +159,6 @@ class QueryRouter:
         Returns:
             (results, metadata)
         """
-        start_time = time.time()
-
         # Try cache first for eventual reads
         if cache_key and consistency == ConsistencyLevel.EVENTUAL:
             cached = self._get_from_cache(cache_key)
@@ -163,7 +170,8 @@ class QueryRouter:
                     consistency=consistency,
                 )
 
-        # Route based on consistency
+        # Route based on consistency - track replica index
+        replica_idx = -1
         if consistency == ConsistencyLevel.STRONG:
             conn = self.db_pool.get_primary_conn()
             source = DataSource.PRIMARY
@@ -171,8 +179,7 @@ class QueryRouter:
 
         elif consistency == ConsistencyLevel.EVENTUAL:
             # Try replica, fall back to primary if unhealthy
-            conn, source = self.db_pool.get_replica_conn(max_lag_ms=3000)
-            lag_ms = self.db_pool._replica_lag[0] if source == DataSource.REPLICA else 0
+            conn, source, replica_idx, lag_ms = self.db_pool.get_replica_conn(max_lag_ms=3000)
 
         else:  # ANALYTICS
             # Would route to Redshift here
@@ -198,12 +205,21 @@ class QueryRouter:
 
             return results, metadata
 
-        except Exception:
+        except Exception as e:
             self._circuit_breaker_failures += 1
             if self._circuit_breaker_failures >= self._circuit_breaker_threshold:
                 print("Circuit breaker open, routing to primary")
+                # FIXED: Return original connection first
+                if source == DataSource.PRIMARY:
+                    self.db_pool.primary_pool.putconn(conn)
+                elif replica_idx >= 0:
+                    self.db_pool.replica_pools[replica_idx].putconn(conn)
+
                 # Circuit breaker: route to primary
                 conn = self.db_pool.get_primary_conn()
+                source = DataSource.PRIMARY
+                replica_idx = -1
+
                 with conn.cursor() as cur:
                     cur.execute(query, params)
                     results = cur.fetchall()
@@ -218,16 +234,11 @@ class QueryRouter:
             else:
                 raise
         finally:
+            # FIXED: Return connection to correct pool
             if source == DataSource.PRIMARY:
                 self.db_pool.primary_pool.putconn(conn)
-            else:
-                # Return to appropriate replica pool
-                for pool in self.db_pool.replica_pools:
-                    try:
-                        pool.putconn(conn)
-                        break
-                    except:
-                        continue
+            elif replica_idx >= 0:
+                self.db_pool.replica_pools[replica_idx].putconn(conn)
 
     def _get_from_cache(self, key: str) -> Optional[List[tuple]]:
         """Retrieve from Redis cache"""
@@ -267,15 +278,15 @@ class WriteOptimizer:
         try:
             # Use COPY for bulk insert
             with conn.cursor() as cur:
-                # Prepare CSV data
-                csv_data = "\n".join(
-                    [
+                # FIXED: Prepare CSV data as file-like object (io.StringIO)
+                csv_lines = []
+                for e in events:
+                    csv_lines.append(
                         f"{e['entity_id']}\t{e['tenant_id']}\t{e['attribute_id']}\t"
                         f"{e.get('value', '')}\t{e.get('value_int', '')}\t"
                         f"{e.get('value_decimal', '')}\t{e.get('ingested_at', '')}"
-                        for e in events
-                    ]
-                )
+                    )
+                csv_data = io.StringIO("\n".join(csv_lines))
 
                 # COPY into staging
                 cur.copy_from(
@@ -349,11 +360,11 @@ if __name__ == "__main__":
     results, metadata = router.execute_query(
         """
         SELECT e.entity_id, ej.hot_attrs
-            FROM entities e
-            JOIN entity_jsonb ej USING (entity_id, tenant_id)
-            WHERE e.tenant_id = %s
-            AND ej.hot_attrs->>'status' = %s
-            LIMIT 100
+        FROM entities e
+        JOIN entity_jsonb ej USING (entity_id, tenant_id)
+        WHERE e.tenant_id = %s
+          AND ej.hot_attrs->>'status' = %s
+        LIMIT 100
         """,
         (123, "active"),
         consistency=ConsistencyLevel.STRONG,

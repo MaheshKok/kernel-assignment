@@ -209,8 +209,7 @@ $$ LANGUAGE plpgsql;
 CREATE TRIGGER update_entities_updated_at BEFORE UPDATE ON entities
     FOR EACH ROW EXECUTE FUNCTION update_updated_at();
 
-CREATE TRIGGER update_entity_values_updated_at BEFORE UPDATE ON entity_values
-    FOR EACH ROW EXECUTE FUNCTION update_updated_at();
+-- Note: entity_values_ts is append-only, no UPDATE trigger needed
 
 -- Function for efficient multi-attribute queries
 CREATE OR REPLACE FUNCTION find_entities_by_attributes(
@@ -242,52 +241,65 @@ $$ LANGUAGE plpgsql;
 
 -- Statistics and maintenance
 ANALYZE entities;
-ANALYZE entity_values;
+ANALYZE entity_values_ts;
 ANALYZE entity_jsonb;
 
 -- Example Queries
 
--- 1. OPERATIONAL QUERY: Find entities with multiple attribute filters
+-- 1. OPERATIONAL QUERY: Find entities with hot attribute filters
 -- Find all entities for tenant 123 where color='red' AND size > 100
-WITH filtered_entities AS (
-    -- First, check hot attributes in JSONB
-    SELECT e.entity_id 
-    FROM entity_jsonb e
-    WHERE e.tenant_id = 123
-    AND e.hot_attrs @> '{"color": "red"}'::jsonb
-    AND (e.hot_attrs->>'size')::int > 100
-)
 SELECT 
     e.entity_id,
     e.entity_type,
     e.created_at,
-    ej.hot_attrs,
-    array_agg(
-        json_build_object(
-            'attribute', a.attribute_name,
-            'value', ev.value
-        )
-    ) as additional_attributes
+    ej.hot_attrs
 FROM entities e
 JOIN entity_jsonb ej ON e.entity_id = ej.entity_id AND e.tenant_id = ej.tenant_id
-LEFT JOIN entity_values ev ON e.entity_id = ev.entity_id AND e.tenant_id = ev.tenant_id
-LEFT JOIN attributes a ON ev.attribute_id = a.attribute_id
-WHERE e.entity_id IN (SELECT entity_id FROM filtered_entities)
-AND e.tenant_id = 123
-AND e.is_deleted = false
-GROUP BY e.entity_id, e.entity_type, e.created_at, ej.hot_attrs
+WHERE e.tenant_id = 123
+  AND ej.hot_attrs @> '{"color": "red"}'::jsonb
+  AND (ej.hot_attrs->>'size')::int > 100
+  AND e.is_deleted = false
 LIMIT 100;
 
--- 2. ANALYTICAL QUERY: Distribution of attribute values with aggregation
--- Analyze distribution of categories and their average numeric attributes
+-- 1b. COLD ATTRIBUTE QUERY: Find entities by non-hot attributes
+-- Find entities with specific firmware version (cold attribute)
+WITH firmware_entities AS (
+    SELECT DISTINCT entity_id, tenant_id
+    FROM entity_values_ts
+    WHERE tenant_id = 123
+      AND attribute_id = 42  -- firmware_version
+      AND value = 'v2.3.1'
+      AND ingested_at >= NOW() - INTERVAL '7 days'  -- Partition pruning
+)
+SELECT 
+    e.entity_id,
+    e.entity_type,
+    ej.hot_attrs,
+    ev_latest.value as firmware_version
+FROM firmware_entities fe
+JOIN entities e USING (entity_id, tenant_id)
+JOIN entity_jsonb ej USING (entity_id, tenant_id)
+JOIN LATERAL (
+    SELECT value
+    FROM entity_values_ts
+    WHERE entity_id = fe.entity_id
+      AND tenant_id = fe.tenant_id
+      AND attribute_id = 42
+    ORDER BY ingested_at DESC
+    LIMIT 1
+) ev_latest ON true
+LIMIT 100;
+
+-- 2. ANALYTICAL QUERY: Distribution of attribute values over time
+-- Analyze category distribution and numeric aggregates (last 30 days)
 WITH category_entities AS (
     SELECT 
         ev.entity_id,
         ev.value as category
-    FROM entity_values ev
+    FROM entity_values_ts ev
     WHERE ev.tenant_id = 123
-    AND ev.attribute_id = 2  -- category attribute
-    AND ev.updated_at >= CURRENT_DATE - INTERVAL '30 days'
+      AND ev.attribute_id = 2  -- category attribute
+      AND ev.ingested_at >= CURRENT_DATE - INTERVAL '30 days'
 ),
 numeric_aggregates AS (
     SELECT 
@@ -298,11 +310,12 @@ numeric_aggregates AS (
         MAX(ev.value_decimal) as max_value,
         COUNT(*) as sample_count
     FROM category_entities ce
-    JOIN entity_values ev ON ce.entity_id = ev.entity_id
+    JOIN entity_values_ts ev ON ce.entity_id = ev.entity_id AND ce.tenant_id = ev.tenant_id
     JOIN attributes a ON ev.attribute_id = a.attribute_id
     WHERE ev.tenant_id = 123
-    AND ev.value_decimal IS NOT NULL
-    AND a.data_type = 'decimal'
+      AND ev.value_decimal IS NOT NULL
+      AND a.data_type = 'decimal'
+      AND ev.ingested_at >= CURRENT_DATE - INTERVAL '30 days'
     GROUP BY ce.category, a.attribute_name
 )
 SELECT 
