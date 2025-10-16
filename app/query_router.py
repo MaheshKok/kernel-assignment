@@ -1,11 +1,6 @@
 """
-Query Router for EAV Platform (FIXED VERSION)
+Query Router for EAV Platform
 Implements intelligent routing between primary, replicas, cache, and OLAP based on freshness requirements
-
-FIXES:
-1. Connection leak in circuit breaker (now properly tracks replica_idx)
-2. copy_from() now uses io.StringIO instead of raw string
-3. Lag tracking uses correct replica index
 """
 
 import enum
@@ -80,9 +75,11 @@ class DatabasePool:
     def get_primary_conn(self):
         return self.primary_pool.getconn()
 
-    def get_replica_conn(self, max_lag_ms: int = 3000) -> Tuple[Any, DataSource, int, int]:
+    def get_replica_conn(
+        self, max_lag_ms: int = 3000
+    ) -> Tuple[Any, DataSource, int, int]:
         """Get connection to least-lagged replica under threshold
-        
+
         Returns: (connection, source, replica_index, lag_ms)
         """
         healthy_replicas = [
@@ -179,7 +176,9 @@ class QueryRouter:
 
         elif consistency == ConsistencyLevel.EVENTUAL:
             # Try replica, fall back to primary if unhealthy
-            conn, source, replica_idx, lag_ms = self.db_pool.get_replica_conn(max_lag_ms=3000)
+            conn, source, replica_idx, lag_ms = self.db_pool.get_replica_conn(
+                max_lag_ms=3000
+            )
 
         else:  # ANALYTICS
             # Would route to Redshift here
@@ -191,6 +190,9 @@ class QueryRouter:
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 results = cur.fetchall()
+
+            # FIXED: Reset circuit breaker on success
+            self._circuit_breaker_failures = 0
 
             # Cache result if requested
             if cache_key and consistency == ConsistencyLevel.EVENTUAL:
@@ -205,11 +207,11 @@ class QueryRouter:
 
             return results, metadata
 
-        except Exception as e:
+        except Exception:
             self._circuit_breaker_failures += 1
             if self._circuit_breaker_failures >= self._circuit_breaker_threshold:
                 print("Circuit breaker open, routing to primary")
-                # FIXED: Return original connection first
+                # Return original connection first
                 if source == DataSource.PRIMARY:
                     self.db_pool.primary_pool.putconn(conn)
                 elif replica_idx >= 0:
@@ -224,6 +226,9 @@ class QueryRouter:
                     cur.execute(query, params)
                     results = cur.fetchall()
 
+                # FIXED: Reset counter after successful fallback
+                self._circuit_breaker_failures = 0
+
                 metadata = QueryMetadata(
                     source=DataSource.PRIMARY,
                     lag_ms=0,
@@ -234,7 +239,7 @@ class QueryRouter:
             else:
                 raise
         finally:
-            # FIXED: Return connection to correct pool
+            # Return connection to correct pool
             if source == DataSource.PRIMARY:
                 self.db_pool.primary_pool.putconn(conn)
             elif replica_idx >= 0:

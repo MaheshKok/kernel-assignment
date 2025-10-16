@@ -214,7 +214,8 @@ CREATE TRIGGER update_entities_updated_at BEFORE UPDATE ON entities
 -- Function for efficient multi-attribute queries
 CREATE OR REPLACE FUNCTION find_entities_by_attributes(
     p_tenant_id BIGINT,
-    p_filters JSONB
+    p_filters JSONB,
+    p_recent_days INT DEFAULT 7
 ) RETURNS TABLE(entity_id BIGINT) AS $$
 BEGIN
     RETURN QUERY
@@ -226,9 +227,10 @@ BEGIN
         FROM jsonb_array_elements(p_filters) as attr
     )
     SELECT DISTINCT ev.entity_id
-    FROM entity_values ev
+    FROM entity_values_ts ev
     JOIN attribute_filters af ON ev.attribute_id = af.attr_id
     WHERE ev.tenant_id = p_tenant_id
+    AND ev.ingested_at >= NOW() - (p_recent_days || ' days')::INTERVAL
     AND (
         (af.op = '=' AND ev.value = af.attr_value) OR
         (af.op = '>' AND ev.value_int > af.attr_value::BIGINT) OR
