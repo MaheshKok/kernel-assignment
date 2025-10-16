@@ -1,6 +1,30 @@
 """
 Query Router for EAV Platform
-Implements intelligent routing between primary, replicas, cache, and OLAP based on freshness requirements
+
+Implements intelligent routing between primary, replicas, cache, and OLAP based on
+freshness requirements. Critical component for serving ~10K OLTP inserts/sec and
+immediate reads for user-visible flows.
+
+Key Features:
+- Row-Level Security (RLS) tenant isolation via SET app.current_tenant_id
+- Circuit breaker with automatic primary fallback on replica lag
+- Redis caching for hot attributes (90% hit rate target)
+- Replica lag detection via heartbeat table
+- HTTP response header generation for freshness surfacing
+
+Data Flow:
+  Write Path:  COPY → entity_values_ingest → stage_flush() → entity_values_ts
+               ↳ upsert_hot_attrs() → entity_jsonb → Redis cache invalidation
+
+  Read Path:   Cache (0ms lag) → Replica (<3s lag) → Primary (0ms lag)
+
+Note: stage_flush() and upsert_hot_attrs() are SECURITY DEFINER functions that
+bypass RLS for multi-tenant batch operations.
+
+See Also:
+- schemas/FIXES_APPLIED.md - RLS implementation details
+- docs/data-flow.md - Replication architecture
+- docs/CONSTRAINTS_IMPLEMENTATION.md - Multi-tenancy strategy
 """
 
 import enum
@@ -68,9 +92,11 @@ class DatabasePool:
             socket_timeout=1,
         )
 
-        # Track replica lag
+        # Track replica lag (in milliseconds)
         self._replica_lag = [0] * len(self.replica_pools)
-        self._last_lag_check = [0.0] * len(self.replica_pools)
+        # Throttle lag checks to avoid hammering replicas
+        self._last_lag_check = 0.0
+        self._lag_check_interval = 10.0  # Check every 10 seconds
 
     def get_primary_conn(self):
         return self.primary_pool.getconn()
@@ -95,7 +121,18 @@ class DatabasePool:
         return self.replica_pools[idx].getconn(), DataSource.REPLICA, idx, lag
 
     def check_replica_lag(self):
-        """Update replica lag metrics from heartbeat table"""
+        """Update replica lag metrics from heartbeat table
+
+        Throttled to avoid excessive health checks (max once per 10s).
+        Returns True if check was performed, False if throttled.
+        """
+        # Throttle: don't check more than once per interval
+        now = time.time()
+        if now - self._last_lag_check < self._lag_check_interval:
+            return False
+
+        self._last_lag_check = now
+
         primary_conn = self.get_primary_conn()
         try:
             with primary_conn.cursor() as cur:
@@ -105,6 +142,7 @@ class DatabasePool:
                 primary_ts = cur.fetchone()[0]
 
             for i, replica_pool in enumerate(self.replica_pools):
+                replica_conn = None
                 try:
                     replica_conn = replica_pool.getconn()
                     with replica_conn.cursor() as cur:
@@ -121,12 +159,17 @@ class DatabasePool:
                         if result:
                             replica_ts = result[0]
                             self._replica_lag[i] = int(primary_ts - replica_ts)
-                    replica_pool.putconn(replica_conn)
                 except Exception as e:
                     print(f"Replica {i} lag check failed: {e}")
                     self._replica_lag[i] = 999999  # Mark as unavailable
+                finally:
+                    # CRITICAL: Always return connection even on error
+                    if replica_conn is not None:
+                        replica_pool.putconn(replica_conn)
         finally:
             self.primary_pool.putconn(primary_conn)
+
+        return True
 
 
 class QueryRouter:
@@ -141,6 +184,7 @@ class QueryRouter:
         self,
         query: str,
         params: tuple,
+        tenant_id: Optional[int] = None,
         consistency: ConsistencyLevel = ConsistencyLevel.EVENTUAL,
         cache_key: Optional[str] = None,
         cache_ttl: int = 60,
@@ -151,6 +195,7 @@ class QueryRouter:
         Args:
             query: SQL query
             params: Query parameters
+            tenant_id: Tenant ID for RLS isolation (required for tenant-scoped queries)
             consistency: Required consistency level
             cache_key: Optional Redis cache key
             cache_ttl: Cache TTL in seconds
@@ -158,6 +203,14 @@ class QueryRouter:
         Returns:
             (results, metadata)
         """
+        # CRITICAL: Validate tenant_id for RLS
+        # Without this, RLS policies block queries and they return 0 rows silently
+        if tenant_id is None:
+            raise ValueError(
+                "tenant_id is required for queries on tenant-scoped tables. "
+                "Pass tenant_id explicitly or use non-tenant queries. "
+                "See: schemas/FIXES_APPLIED.md for RLS implementation details."
+            )
         # Try cache first for eventual reads
         if cache_key and consistency == ConsistencyLevel.EVENTUAL:
             cached = self._get_from_cache(cache_key)
@@ -190,6 +243,9 @@ class QueryRouter:
 
         try:
             with conn.cursor() as cur:
+                # Set tenant context for RLS (must be done per transaction)
+                cur.execute("SET LOCAL app.current_tenant_id = %s", (tenant_id,))
+
                 cur.execute(query, params)
                 results = cur.fetchall()
 
@@ -225,6 +281,9 @@ class QueryRouter:
                 replica_idx = -1
 
                 with conn.cursor() as cur:
+                    # Set tenant context for RLS (circuit breaker path)
+                    cur.execute("SET LOCAL app.current_tenant_id = %s", (tenant_id,))
+
                     cur.execute(query, params)
                     results = cur.fetchall()
 
@@ -248,11 +307,17 @@ class QueryRouter:
                 self.db_pool.replica_pools[replica_idx].putconn(conn)
 
     def _get_from_cache(self, key: str) -> Optional[List[tuple]]:
-        """Retrieve from Redis cache"""
+        """Retrieve from Redis cache
+
+        Note: JSON serialization converts tuples → lists.
+        Convert back to tuples to match cursor.fetchall() behavior.
+        """
         try:
             cached = self.db_pool.redis_client.get(key)
             if cached:
-                return json.loads(cached)
+                rows = json.loads(cached)
+                # Convert lists back to tuples (JSON doesn't preserve tuples)
+                return [tuple(row) if isinstance(row, list) else row for row in rows]
         except Exception as e:
             print(f"Cache get failed: {e}")
         return None
@@ -264,14 +329,39 @@ class QueryRouter:
         except Exception as e:
             print(f"Cache set failed: {e}")
 
+    def generate_response_headers(self, metadata: QueryMetadata) -> Dict[str, str]:
+        """
+        Generate HTTP response headers for freshness surfacing
+
+        As documented in docs/data-flow.md (lines 302-329), every API response
+        includes freshness metadata for transparency.
+
+        Returns headers:
+        - X-Data-Source: primary | replica | redis | redshift
+        - X-Data-Lag-Seconds: float (0 for cache/primary)
+        - X-Consistency-Level: strong | eventual | analytics
+        - X-Data-Timestamp: Unix timestamp of when data was sampled
+        - X-Cache-Hit: true/false
+        """
+        return {
+            "X-Data-Source": metadata.source.value,
+            "X-Data-Lag-Seconds": f"{metadata.lag_ms / 1000.0:.3f}",
+            "X-Consistency-Level": metadata.consistency.value,
+            "X-Data-Timestamp": str(int(metadata.sampled_at)),
+            "X-Cache-Hit": "true" if metadata.source == DataSource.REDIS else "false",
+        }
+
 
 class WriteOptimizer:
-    """Optimizes writes for high throughput"""
+    """Optimizes writes for high throughput
+
+    Note: stage_flush() and upsert_hot_attrs() are SECURITY DEFINER functions
+    that bypass RLS to handle multi-tenant batch operations.
+    See: schemas/entity_values_ingest.sql, schemas/entity_jsonb.sql
+    """
 
     def __init__(self, db_pool: DatabasePool):
         self.db_pool = db_pool
-        self._batch_buffer = []
-        self._batch_size = 1000
         self._flush_interval = 0.1  # 100ms
         self._last_flush = time.time()
 
@@ -285,13 +375,22 @@ class WriteOptimizer:
         try:
             # Use COPY for bulk insert
             with conn.cursor() as cur:
-                # FIXED: Prepare CSV data as file-like object (io.StringIO)
+                # CRITICAL: Use \N for NULL values (not empty strings)
+                # Empty strings fail when Postgres tries to cast to numeric types
                 csv_lines = []
                 for e in events:
+                    # Helper function to format NULL vs value
+                    def fmt(val):
+                        return "\\N" if val is None or val == "" else str(val)
+
                     csv_lines.append(
-                        f"{e['entity_id']}\t{e['tenant_id']}\t{e['attribute_id']}\t"
-                        f"{e.get('value', '')}\t{e.get('value_int', '')}\t"
-                        f"{e.get('value_decimal', '')}\t{e.get('ingested_at', '')}"
+                        f"{fmt(e.get('entity_id'))}\t"
+                        f"{fmt(e.get('tenant_id'))}\t"
+                        f"{fmt(e.get('attribute_id'))}\t"
+                        f"{fmt(e.get('value'))}\t"
+                        f"{fmt(e.get('value_int'))}\t"
+                        f"{fmt(e.get('value_decimal'))}\t"
+                        f"{fmt(e.get('ingested_at'))}"
                     )
                 csv_data = io.StringIO("\n".join(csv_lines))
 
@@ -311,6 +410,7 @@ class WriteOptimizer:
                 )
 
                 # Async flush from staging to partitions
+                # stage_flush() is SECURITY DEFINER - bypasses RLS for multi-tenant batches
                 if time.time() - self._last_flush > self._flush_interval:
                     cur.execute("SELECT stage_flush(50000)")
                     self._last_flush = time.time()
@@ -325,10 +425,14 @@ class WriteOptimizer:
         """
         Synchronously upsert hot attributes for immediate read-after-write
         Also invalidate Redis cache
+
+        Note: upsert_hot_attrs() is SECURITY DEFINER - bypasses RLS
+        See: schemas/entity_jsonb.sql lines 67-84
         """
         conn = self.db_pool.get_primary_conn()
         try:
             with conn.cursor() as cur:
+                # No need to SET tenant context - function is SECURITY DEFINER
                 cur.execute(
                     "SELECT upsert_hot_attrs(%s, %s, %s)",
                     (tenant_id, entity_id, json.dumps(attributes)),
@@ -364,6 +468,7 @@ if __name__ == "__main__":
     writer = WriteOptimizer(db_pool)
 
     # Operational query (strong consistency)
+    # CRITICAL: Pass tenant_id for RLS isolation
     results, metadata = router.execute_query(
         """
         SELECT e.entity_id, ej.hot_attrs
@@ -374,10 +479,23 @@ if __name__ == "__main__":
         LIMIT 100
         """,
         (123, "active"),
+        tenant_id=123,  # Required for RLS
         consistency=ConsistencyLevel.STRONG,
     )
 
     print(f"Query executed on {metadata.source.value} with {metadata.lag_ms}ms lag")
+
+    # Generate HTTP response headers (for API responses)
+    headers = router.generate_response_headers(metadata)
+    print(f"Response headers: {headers}")
+    # Example output:
+    # {
+    #   "X-Data-Source": "primary",
+    #   "X-Data-Lag-Seconds": "0.000",
+    #   "X-Consistency-Level": "strong",
+    #   "X-Data-Timestamp": "1697472000",
+    #   "X-Cache-Hit": "false"
+    # }
 
     # Ingest telemetry
     events = [
