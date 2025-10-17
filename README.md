@@ -1,7 +1,3 @@
-# kernel-assignment
-
-This is an initial commit for the kernel assignment repository.
-
 # EAV at Scale - Complete Solution
 
 ## Overview
