@@ -21,6 +21,10 @@ Production-ready EAV (Entity-Attribute-Value) design for AtlasCo's telemetry pla
 - **Query router** with circuit breaker and lag-aware replica selection
 - **3 read replicas** (prod) with <3s lag SLA
 
+### Note:
+
+AI has been used to generate terraform code and brainstorming architecture.
+
 ### Data Model
 
 ```
