@@ -72,8 +72,25 @@ terraform apply -var environment=prod
 
 ### 2. Initialize Database
 
+Apply schema files in order:
+
 ```bash
-psql -h <rds-endpoint> -U eav_admin -d eav_db -f schema.sql
+# Run from project root
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/extensions.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/tenants.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/entities.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/attributes.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/entity_values_ts.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/entity_values_ingest.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/entity_jsonb.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/replication_heartbeat.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/mv_entity_attribute_stats.sql
+psql -h <rds-endpoint> -U eav_admin -d eav_db -f schemas/queries.sql
+
+# Or apply all at once:
+for f in schemas/{extensions,tenants,entities,attributes,entity_values_ts,entity_values_ingest,entity_jsonb,replication_heartbeat,mv_entity_attribute_stats,queries}.sql; do
+  psql -h <rds-endpoint> -U eav_admin -d eav_db -f "$f"
+done
 ```
 
 ### 3. Configure Application
@@ -248,22 +265,31 @@ When hitting limits:
 
 ```
 .
-├── solution.md              # Design document
-├── schema.sql               # PostgreSQL DDL + queries
-├── infra/
-│   └── main.tf              # Original Terraform
+├── README.md                           # This file
+├── assignment.md                       # Original requirements
+├── architecture-decisions-qna.md       # Q&A on design decisions
+├── follow-up-questions.md              # Technical clarifications
+├── HIVE_MIND_ANALYSIS_REPORT.md        # AI-assisted analysis notes
+├── schemas/                            # PostgreSQL DDL (apply in order)
+│   ├── extensions.sql                  # pg_partman, pg_stat_statements
+│   ├── tenants.sql                     # Multi-tenancy base table
+│   ├── entities.sql                    # Entity definitions + RLS
+│   ├── attributes.sql                  # Attribute metadata
+│   ├── entity_values_ts.sql            # Time-series EAV (partitioned)
+│   ├── entity_values_ingest.sql        # UNLOGGED staging + flush function
+│   ├── entity_jsonb.sql                # Hot attributes + upsert function
+│   ├── replication_heartbeat.sql       # Lag tracking table
+│   ├── mv_entity_attribute_stats.sql   # Analytics materialized view
+│   └── queries.sql                     # Example operational queries
+├── docs/                               # Detailed documentation
+│   ├── solution.md                     # High-level design summary
+│   ├── data-flow.md                    # Write/read paths, replication
+│   ├── constraints-implementation.md   # Multi-tenancy & scaling constraints
+│   └── notes.md                        # Implementation TODOs
 ├── app/
-│   └── query_router.py      # Application routing logic
-├── ops/
-│   └── monitoring.sql       # Monitoring queries
-├── notes.md                 # TODOs
-└── README.md                # This file
+│   └── query_router.py                 # Query routing + write optimizer
+├── infra/
+│   └── main.tf                         # Terraform IaC (current version)
+└── ops/
+    └── monitoring.sql                  # Health checks & metrics queries
 ```
-
-## Support
-
-For questions or issues, contact: [Your Team]
-
-## License
-
-[Your License]
