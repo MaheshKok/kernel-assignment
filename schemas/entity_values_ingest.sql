@@ -23,7 +23,7 @@ CREATE UNLOGGED TABLE entity_values_ingest(
 -- ============================================================================
 -- WARNING: Managed services (Aurora, RDS, Cloud SQL) may ignore or override
 -- autovacuum_vacuum_cost_delay and related settings. Test in your environment.
-ALTER TABLE entity_values_ingest SET (autovacuum_vacuum_threshold = 50, autovacuum_vacuum_scale_factor = 0.0, autovacuum_analyze_threshold = 50, autovacuum_vacuum_cost_delay = 0);
+ALTER TABLE entity_values_ingest SET (autovacuum_vacuum_threshold = 50, autovacuum_vacuum_scale_factor = 0.05, autovacuum_analyze_threshold = 10000, autovacuum_vacuum_cost_delay = 0);
 
 -- ============================================================================
 -- BATCH FLUSH FUNCTION
