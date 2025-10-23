@@ -14,7 +14,6 @@ CREATE TABLE entity_jsonb(
     entity_id bigint NOT NULL,
     tenant_id bigint NOT NULL,
     hot_attrs jsonb NOT NULL DEFAULT '{}',
-    cold_attrs jsonb DEFAULT '{}',
     updated_at timestamp with time zone DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (entity_id, tenant_id)
 )
