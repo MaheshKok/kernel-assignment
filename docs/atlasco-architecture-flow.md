@@ -135,7 +135,7 @@ Telemetry Event
 │  Ingestion Service                       │
 │  - Validates schema                      │
 │  - Extracts tenant context               │
-│  - Batches events (1000/batch)           │
+│  - Batches events (10K/batch)           │
 └──────────────┬───────────────────────────┘
                │
                │ COPY protocol (fast bulk insert)
