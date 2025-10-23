@@ -49,9 +49,6 @@ Complete production-ready solution for 200M entity telemetry system with:
 - B-tree for exact lookups
 - Partial indexes for filtered queries (`is_deleted = FALSE`)
 
-### Multi-Tenancy Isolation
-
-> **📖 Full details:** [docs/CONSTRAINTS_IMPLEMENTATION.md](CONSTRAINTS_IMPLEMENTATION.md#1-multi-tenancy-isolation-strategy)
 
 **Row-Level Security (RLS) with `tenant_id` column:**
 
